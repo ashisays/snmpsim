@@ -1,0 +1,27 @@
+# SNMP Server Configuration
+snmp:
+  community: public
+  versions: [1, 2c, 3]
+  v3:
+    username: admin
+    auth_key: authpassword
+    priv_key: privpassword
+    security_level: authPriv
+    auth_protocol: MD5
+    priv_protocol: DES
+
+listen:
+  port: 161
+  ip_ranges:
+    - ip: 192.168.1.0/24
+      description: Local network
+    - ip: 10.0.0.0/8
+      description: Corporate network
+
+logging:
+  level: INFO
+  file: snmp_server.log
+
+response_settings:
+  csv_file: data.csv
+  refresh_interval: 300  # seconds
