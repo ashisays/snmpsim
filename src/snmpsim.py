@@ -1,179 +1,326 @@
-import yaml
-import socket
-import ipaddress
-import csv
-import json
-from typing import Dict, List, Union
-from pysnmp.hlapi import *
-from pysnmp.carrier.asyncio.dgram import udp
-from pysnmp.entity import engine, config
-from pysnmp.entity.rfc3413 import cmdrsp, context
-from pysnmp.proto.api import v2c
-from pysnmp.smi import builder, instrum, exval
-import asyncio
-import random
-from datetime import datetime
+    import socket
+    import struct
+    import yaml
+    import ipaddress
+    import csv
+    import json
+    from typing import Dict, List, Union
+    import asyncio
+    from datetime import datetime
+    import binascii
 
-class ConfigLoader:
-    @staticmethod
-    def load_config(config_file: str) -> dict:
-        """Load YAML configuration file"""
-        with open(config_file, 'r') as f:
-            return yaml.safe_load(f)
+    class SNMPPacket:
+        def __init__(self):
+            self.version = None
+            self.community = None
+            self.pdu_type = None
+            self.request_id = None
+            self.error_status = 0
+            self.error_index = 0
+            self.varbinds = []
 
-    @staticmethod
-    def load_csv_data(csv_file: str) -> List[dict]:
-        """Load CSV data file"""
-        data = []
-        with open(csv_file, 'r') as f:
-            reader = csv.DictReader(f)
-            for row in reader:
-                data.append(row)
-        return data
+        @staticmethod
+        def decode_length(data: bytes, offset: int) -> tuple:
+            """Decode ASN.1 length field"""
+            if data[offset] < 128:
+                return data[offset], offset + 1
 
-class ResponseGenerator:
-    def __init__(self, csv_data: List[dict]):
-        self.csv_data = csv_data
-        self.mac_counters = {}  # Track MAC address counters per prefix
+            length_octets = data[offset] & 0x7F
+            length = 0
+            offset += 1
+            for _ in range(length_octets):
+                length = (length << 8) | data[offset]
+                offset += 1
+            return length, offset
 
-    def parse_range(self, value: str) -> List[str]:
-        """Parse range values in format 'start-end' or semicolon-separated values"""
-        if not value or not isinstance(value, str):
-            return [value]
+        @staticmethod
+        def encode_length(length: int) -> bytes:
+            """Encode ASN.1 length field"""
+            if length < 128:
+                return bytes([length])
 
-        if ';' in value:
-            return value.split(';')
-        elif '-' in value and '$$' not in value:
-            start, end = value.split('-')
-            return [str(i) for i in range(int(start), int(end) + 1)]
-        return [value]
+            length_bytes = []
+            temp_length = length
+            while temp_length:
+                length_bytes.insert(0, temp_length & 0xFF)
+                temp_length >>= 8
+            return bytes([0x80 | len(length_bytes)] + length_bytes)
 
-    def generate_mac(self, prefix: str) -> str:
-        """Generate MAC address with given prefix"""
-        if prefix not in self.mac_counters:
-            self.mac_counters[prefix] = 0
+        def decode(self, data: bytes) -> None:
+            """Decode SNMP packet"""
+            offset = 0
+            # Sequence
+            if data[offset] != 0x30:
+                raise ValueError("Invalid SNMP packet")
+            length, offset = self.decode_length(data, offset + 1)
 
-        counter = self.mac_counters[prefix]
-        self.mac_counters[prefix] += 1
+            # Version
+            if data[offset] != 0x02:
+                raise ValueError("Invalid version field")
+            ver_len, offset = self.decode_length(data, offset + 1)
+            self.version = int.from_bytes(data[offset:offset + ver_len], 'big')
+            offset += ver_len
 
-        # Convert counter to MAC suffix
-        suffix = format(counter, '06x')
-        return f"{prefix}{suffix}"
+            # Community
+            if data[offset] != 0x04:
+                raise ValueError("Invalid community field")
+            comm_len, offset = self.decode_length(data, offset + 1)
+            self.community = data[offset:offset + comm_len].decode()
+            offset += comm_len
 
-    def get_response_value(self, field: str, ip: str) -> str:
-        """Get response value for a field, handling ranges and dynamic values"""
-        for entry in self.csv_data:
-            if self.ip_in_range(ip, entry['iprange']):
-                value = entry[field]
-                if '$$' in value:  # Dynamic MAC address
-                    prefix = value.split('$$')[0]
-                    return self.generate_mac(prefix)
+            # PDU
+            self.pdu_type = data[offset]
+            pdu_len, offset = self.decode_length(data, offset + 1)
+
+            # Request ID
+            if data[offset] != 0x02:
+                raise ValueError("Invalid request ID field")
+            req_len, offset = self.decode_length(data, offset + 1)
+            self.request_id = int.from_bytes(data[offset:offset + req_len], 'big')
+            offset += req_len
+
+            # Parse varbinds
+            while offset < len(data):
+                if data[offset] == 0x30:  # Sequence
+                    seq_len, offset = self.decode_length(data, offset + 1)
+                    # Parse OID and value
+                    oid_type = data[offset]
+                    oid_len, offset = self.decode_length(data, offset + 1)
+                    oid = self.decode_oid(data[offset:offset + oid_len])
+                    offset += oid_len
+
+                    value_type = data[offset]
+                    value_len, offset = self.decode_length(data, offset + 1)
+                    value = data[offset:offset + value_len]
+                    offset += value_len
+
+                    self.varbinds.append((oid, value_type, value))
+
+        @staticmethod
+        def decode_oid(data: bytes) -> str:
+            """Decode ASN.1 OID"""
+            oid = []
+            first_byte = data[0]
+            oid.extend([first_byte // 40, first_byte % 40])
+
+            value = 0
+            for byte in data[1:]:
+                if byte & 0x80:
+                    value = (value << 7) | (byte & 0x7F)
                 else:
-                    possible_values = self.parse_range(value)
-                    return random.choice(possible_values)
-        return ''
+                    value = (value << 7) | byte
+                    oid.append(value)
+                    value = 0
+            return '.'.join(map(str, oid))
 
-    @staticmethod
-    def ip_in_range(ip: str, ip_range: str) -> bool:
-        """Check if IP is in the specified range"""
+    class RawSNMPAgent:
+        def __init__(self, config_file: str, csv_file: str):
+            self.config = self.load_config(config_file)
+            self.csv_data = self.load_csv_data(csv_file)
+            self.sockets = {}
+            self.running = False
+
+        @staticmethod
+        def load_config(config_file: str) -> dict:
+            with open(config_file, 'r') as f:
+                return yaml.safe_load(f)
+
+        @staticmethod
+        def load_csv_data(csv_file: str) -> List[dict]:
+            data = []
+            with open(csv_file, 'r') as f:
+                reader = csv.DictReader(f)
+                for row in reader:
+                    data.append(row)
+            return data
+
+        def create_raw_socket(self, ip_range: str) -> socket.socket:
+            """Create a raw socket for SNMP"""
+            sock = socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_UDP)
+            sock.setsockopt(socket.IPPROTO_IP, socket.IP_HDRINCL, 1)
+            sock.bind((ip_range, 0))
+            return sock
+
+        def generate_response(self, request: SNMPPacket, client_address: tuple) -> bytes:
+            """Generate SNMP response"""
+            # Implementation of response generation based on CSV data
+            response = bytearray()
+            # Add SNMP response header
+            response.extend([0x30])  # Sequence
+
+            # Version
+            response.extend([0x02, 0x01, request.version])
+
+            # Community
+            community_bytes = request.community.encode()
+            response.extend([0x04, len(community_bytes)])
+            response.extend(community_bytes)
+
+            # Response PDU
+            response.extend([0xA2])  # Response PDU type
+
+            # Request ID
+            req_id_bytes = request.request_id.to_bytes((request.request_id.bit_length() + 7) // 8, 'big')
+            response.extend([0x02, len(req_id_bytes)])
+            response.extend(req_id_bytes)
+
+            # Error status and index
+            response.extend([0x02, 0x01, 0x00])  # Error status
+            response.extend([0x02, 0x01, 0x00])  # Error index
+
+            # Varbinds
+            varbind_section = bytearray()
+            for oid, _, _ in request.varbinds:
+                # Get value from CSV data
+                value = self.get_value_from_csv(oid, client_address[0])
+                varbind = self.encode_varbind(oid, value)
+                varbind_section.extend(varbind)
+
+            response.extend([0x30, len(varbind_section)])
+            response.extend(varbind_section)
+
+            # Update total length
+            total_length = len(response) - 2
+            length_bytes = SNMPPacket.encode_length(total_length)
+            response[1:1] = length_bytes
+
+            return bytes(response)
+
+        def encode_varbind(self, oid: str, value: str) -> bytes:
+            """Encode a varbind for SNMP response"""
+            varbind = bytearray()
+            varbind.extend([0x30])  # Sequence
+
+            # OID
+            oid_bytes = self.encode_oid(oid)
+            varbind.extend([0x06, len(oid_bytes)])
+            varbind.extend(oid_bytes)
+
+            # Value
+            value_bytes = value.encode()
+            varbind.extend([0x04, len(value_bytes)])
+            varbind.extend(value_bytes)
+
+            # Update length
+            total_length = len(varbind) - 2
+            length_bytes = SNMPPacket.encode_length(total_length)
+            varbind[1:1] = length_bytes
+
+            return bytes(varbind)
+
+        @staticmethod
+        def encode_oid(oid: str) -> bytes:
+            """Encode OID in ASN.1 format"""
+            numbers = [int(x) for x in oid.split('.')]
+            result = bytearray([numbers[0] * 40 + numbers[1]])
+
+            for number in numbers[2:]:
+                if number < 128:
+                    result.append(number)
+                else:
+                    bytes_needed = (number.bit_length() + 6) // 7
+                    for i in range(bytes_needed - 1, -1, -1):
+                        byte = (number >> (i * 7)) & 0x7F
+                        if i != 0:
+                            byte |= 0x80
+                        result.append(byte)
+
+            return bytes(result)
+
+        async def handle_packet(self, sock: socket.socket):
+            """Handle incoming SNMP packets"""
+            while self.running:
+                try:
+                    data, addr = sock.recvfrom(65535)
+                    # Skip IP header (20 bytes) and UDP header (8 bytes)
+                    snmp_data = data[28:]
+
+                    # Parse SNMP packet
+                    packet = SNMPPacket()
+                    packet.decode(snmp_data)
+
+                    # Generate response
+                    response = self.generate_response(packet, addr)
+
+                    # Create UDP header
+                    udp_length = len(response) + 8
+                    udp_header = struct.pack('!HHHH',
+                        161,                    # Source port
+                        addr[1],                # Destination port
+                        udp_length,             # Length
+                        0)                      # Checksum (zero for now)
+
+                    # Create IP header
+                    ip_header = struct.pack('!BBHHHBBH4s4s',
+                        0x45,                   # Version and IHL
+                        0,                      # Type of Service
+                        20 + udp_length,        # Total Length
+                        0,                      # ID
+                        0,                      # Flags and Fragment Offset
+                        255,                    # TTL
+                        socket.IPPROTO_UDP,     # Protocol
+                        0,                      # Checksum (zero for now)
+                        socket.inet_aton(sock.getsockname()[0]),  # Source IP
+                        socket.inet_aton(addr[0]))                # Destination IP
+
+                    # Calculate checksums
+                    ip_checksum = self.calculate_checksum(ip_header)
+                    ip_header = ip_header[:10] + struct.pack('H', ip_checksum) + ip_header[12:]
+
+                    pseudo_header = struct.pack('!4s4sBBH',
+                        socket.inet_aton(sock.getsockname()[0]),
+                        socket.inet_aton(addr[0]),
+                        0,
+                        socket.IPPROTO_UDP,
+                        udp_length)
+                    udp_checksum = self.calculate_checksum(pseudo_header + udp_header + response)
+                    udp_header = udp_header[:6] + struct.pack('!H', udp_checksum)
+
+                    # Send response
+                    sock.sendto(ip_header + udp_header + response, addr)
+
+                except Exception as e:
+                    print(f"Error handling packet: {e}")
+                    continue
+
+        @staticmethod
+        def calculate_checksum(data: bytes) -> int:
+            """Calculate IP/UDP checksum"""
+            if len(data) % 2 == 1:
+                data += b'\0'
+            words = struct.unpack('!%dH' % (len(data) // 2), data)
+            checksum = sum(words)
+            checksum = (checksum >> 16) + (checksum & 0xFFFF)
+            checksum += checksum >> 16
+            return ~checksum & 0xFFFF
+
+        async def start(self):
+            """Start the SNMP agent"""
+            self.running = True
+
+            for ip_range in self.config['listen']['ip_ranges']:
+                sock = self.create_raw_socket(ip_range['ip'])
+                self.sockets[ip_range['ip']] = sock
+                asyncio.create_task(self.handle_packet(sock))
+
+            print("SNMP agent started with raw sockets")
+
+            while self.running:
+                await asyncio.sleep(1)
+
+        def stop(self):
+            """Stop the SNMP agent"""
+            self.running = False
+            for sock in self.sockets.values():
+                sock.close()
+
+    if __name__ == "__main__":
+        agent = RawSNMPAgent('config.yaml', 'data.csv')
+
+        loop = asyncio.get_event_loop()
         try:
-            return ipaddress.ip_address(ip) in ipaddress.ip_network(ip_range)
-        except ValueError:
-            return False
-
-class SNMPAgent:
-    def __init__(self, config_file: str, csv_file: str):
-        self.config = ConfigLoader.load_config(config_file)
-        self.csv_data = ConfigLoader.load_csv_data(csv_file)
-        self.response_generator = ResponseGenerator(self.csv_data)
-        self.engine = engine.SnmpEngine()
-        self.context = context.SnmpContext(self.engine)
-
-        # Set up MIB
-        self.setup_mib()
-
-        # Configure SNMP versions
-        self.setup_snmp_versions()
-
-    def setup_mib(self):
-        """Set up MIB with required OIDs"""
-        mib_builder = builder.MibBuilder()
-
-        # Define OID to field mapping
-        self.oid_mapping = {
-            '1.3.6.1.2.1.1.1': 'sysDesc',
-            '1.3.6.1.2.1.1.2': 'sysObjectID',
-            '1.3.6.1.2.1.1.4': 'sysContact',
-            '1.3.6.1.2.1.1.5': 'sysName',
-            '1.3.6.1.2.1.1.6': 'sysLocation',
-            '1.3.6.1.2.1.25.3.2.1.3': 'hrDeviceType',
-            '1.3.6.1.2.1.25.3.2.1.4': 'hrDeviceDescr',
-            '1.3.6.1.2.1.47.1.1.1.1.2': 'entPhysicalDescr',
-            '1.3.6.1.2.1.47.1.1.1.1.7': 'entPhysicalName',
-            '1.3.6.1.2.1.47.1.1.1.1.8': 'entPhysicalHardwareRev',
-            '1.3.6.1.2.1.47.1.1.1.1.9': 'entPhysicalFirmwareRev',
-            '1.3.6.1.2.1.47.1.1.1.1.10': 'entPhysicalSoftwareRev',
-            '1.3.6.1.2.1.47.1.1.1.1.11': 'entPhysicalSerialNum',
-            '1.3.6.1.2.1.47.1.1.1.1.12': 'entPhyiscalMfgName',
-            '1.3.6.1.2.1.47.1.1.1.1.13': 'entPhyiscalModelName',
-        }
-
-    def setup_snmp_versions(self):
-        """Configure SNMP version-specific settings"""
-        # SNMPv1/v2c community
-        config.addV1System(self.engine, 'read-comm', self.config['snmp']['community'])
-
-        # SNMPv3 settings
-        if 'v3' in self.config['snmp']:
-            config.addV3User(
-                self.engine,
-                self.config['snmp']['v3']['username'],
-                config.usmHMACMD5AuthProtocol,
-                self.config['snmp']['v3']['auth_key'],
-                config.usmDESPrivProtocol,
-                self.config['snmp']['v3']['priv_key']
-            )
-
-    async def handle_get_request(self, request):
-        """Handle SNMP GET requests"""
-        oid = str(request['name'])
-        client_ip = request['transport_address'][0]
-
-        if oid in self.oid_mapping:
-            field = self.oid_mapping[oid]
-            value = self.response_generator.get_response_value(field, client_ip)
-            return v2c.OctetString(value)
-
-        return v2c.NoSuchInstance()
-
-    async def start(self):
-        """Start SNMP agent"""
-        for ip_range in self.config['listen']['ip_ranges']:
-            transport = udp.UdpTransport()
-            await transport.openServerMode((ip_range['ip'], self.config['listen']['port']))
-
-            # Create response handler
-            cmdrsp.GetCommandResponder(self.context)
-            cmdrsp.NextCommandResponder(self.context)
-            cmdrsp.BulkCommandResponder(self.context)
-
-        print(f"SNMP agent started on port {self.config['listen']['port']}")
-
-        while True:
-            await asyncio.sleep(1)
-
-def main():
-    # Load configuration and start agent
-    agent = SNMPAgent('data/config.yaml', 'data/data.csv')
-
-    loop = asyncio.get_event_loop()
-    loop.create_task(agent.start())
-
-    try:
-        loop.run_forever()
-    except KeyboardInterrupt:
-        print("\nShutting down SNMP agent...")
-        loop.close()
-
-if __name__ == "__main__":
-    main()
+            loop.run_until_complete(agent.start())
+        except KeyboardInterrupt:
+            print("\nShutting down SNMP agent...")
+            agent.stop()
+            loop.close()
